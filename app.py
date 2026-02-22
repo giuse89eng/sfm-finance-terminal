@@ -1,96 +1,132 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
 import requests
+from docx import Document
 
-# Configurazione pagina
-st.set_page_config(page_title="SFM Terminal", layout="wide")
+st.set_page_config(page_title="SFM Master Terminal", layout="wide")
 
-# Funzione per trovare il Ticker dal nome (es. Tenaris -> TS)
+# Funzione Ricerca Ticker Robusta
 def trova_ticker(nome):
+    if not nome: return None
     try:
         url = f"https://query2.finance.yahoo.com/v1/finance/search?q={nome}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=5)
-        data = response.json()
-        if data['quotes']:
-            return data['quotes'][0]['symbol']
-        return nome
-    except:
-        return nome
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        return res.json()['quotes'][0]['symbol']
+    except: return nome
 
-st.title("🏦 SFM Intelligence Terminal")
+st.title("🛡️ SFM Master Intelligence Terminal")
 
-# Ricerca azienda
-nome_input = st.text_input("Inserisci Nome Azienda o Ticker", "Tenaris")
-ticker = trova_ticker(nome_input)
-st.info(f"Analizzando il Ticker: {ticker}")
+# Input con valore predefinito gestito per evitare crash
+nome_azienda = st.text_input("Inserisci Azienda per Analisi Profonda", "Tenaris")
+ticker = trova_ticker(nome_azienda)
 
 if ticker:
     try:
         stock = yf.Ticker(ticker)
+        # Scarico tutto subito per evitare chiamate multiple
         info = stock.info
+        cf = stock.cashflow
         hist = stock.history(period="1y")
+        
+        if not cf.empty and 'Free Cash Flow' in cf.index and not hist.empty:
+            st.header(f"Analisi Valutativa: {info.get('longName', ticker)}")
+            
+            # --- MODELLO DCF 10 ANNI (ESATTO DAL TUO EXCEL) ---
+            fcf_base = cf.loc['Free Cash Flow'].iloc[0]
+            cash = info.get('totalCash', 0)
+            debt = info.get('totalDebt', 0)
+            shares = info.get('sharesOutstanding', 1)
+            current_p = info.get('currentPrice', 0)
 
-        if not hist.empty:
-            # --- PARTE 1: DATI E DCF ---
-            st.header(f"Valutazione: {info.get('longName', ticker)}")
-            
-            c1, c2 = st.columns(2)
-            c1.metric("Prezzo Attuale", f"${info.get('currentPrice', 0)}")
-            c2.metric("Rendimento Dividendi", f"{info.get('dividendYield', 0)*100:.2f}%")
+            st.subheader("💎 Proiezione Flussi di Cassa 10 Anni")
+            c1, c2, c3 = st.columns(3)
+            g_rate = c1.slider("Crescita Annuale (1-10y) %", 0, 30, 10) / 100
+            wacc = c2.slider("WACC (Sconto) %", 5, 15, 10) / 100
+            p_rate = c3.slider("Crescita Perpetua %", 1.0, 4.0, 2.5) / 100
 
-            st.divider()
-            st.subheader("💎 Valutazione Intrinseca (DCF)")
+            # Tabella di marcia 10 anni
+            anni = list(range(1, 11))
+            fcf_list = []
+            pv_list = []
+            fcf_step = fcf_base
+            for a in anni:
+                fcf_step *= (1 + g_rate)
+                fcf_list.append(fcf_step)
+                pv_list.append(fcf_step / ((1 + wacc) ** a))
             
-            cf = stock.cashflow
-            if 'Free Cash Flow' in cf.index:
-                fcf = cf.loc['Free Cash Flow'].iloc[0]
-                pfn = info.get('totalCash', 0) - info.get('totalDebt', 0)
-                
-                # Input per il calcolo
-                wacc = st.slider("Tasso Sconto (WACC) %", 5.0, 15.0, 9.0) / 100
-                crescita = st.slider("Crescita Attesa %", 0.0, 20.0, 5.0) / 100
-                
-                # Calcolo DCF rapido
-                valore_terminale = (fcf * 1.02) / (wacc - 0.02)
-                fair_value = ((fcf * (1 + crescita) + valore_terminale) + pfn) / info.get('sharesOutstanding', 1)
-                margine = (1 - (info.get('currentPrice') / fair_value)) * 100
-                
-                st.metric("Fair Value", f"${fair_value:.2f}", f"Margine: {margine:.1f}%")
-            
-            # --- PARTE 2: EXCEL ---
-            st.divider()
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                hist.to_excel(writer, sheet_name='Dati_Storici')
-            
-            st.download_button(
-                label="📥 Scarica Report Excel",
-                data=buffer.getvalue(),
-                file_name=f"Analisi_{ticker}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            # Valore Terminale e Intrinseco
+            tv = (fcf_list[-1] * (1 + p_rate)) / (wacc - p_rate)
+            pv_tv = tv / ((1 + wacc) ** 10)
+            fair_value = (sum(pv_list) + pv_tv + cash - debt) / shares
+            upside = ((fair_value / current_p) - 1) * 100
 
-            # --- PARTE 3: GRAFICO (IN FONDO) ---
+            # --- ANALISI STRATEGICA LONG/SHORT ---
             st.divider()
-            st.subheader("📈 Analisi Tecnica")
+            # Calcolo RSI per il Timing
+            delta = hist['Close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean().iloc[-1]
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean().iloc[-1]
+            rsi = 100 - (100 / (1 + (gain/loss)))
+
+            col_s1, col_s2 = st.columns(2)
+            with col_s1:
+                st.metric("Fair Value", f"${fair_value:.2f}", f"{upside:.1f}% Upside")
+                if upside > 20 and rsi < 45:
+                    st.success("🎯 SEGNALE: STRONG BUY (Value + Timing)")
+                elif upside < -10 and rsi > 65:
+                    st.error("🎯 SEGNALE: STRONG SELL (Overvalued)")
+                else:
+                    st.warning("🎯 SEGNALE: NEUTRALE / ATTENDERE")
             
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+            with col_s2:
+                st.metric("RSI Tecnico", f"{rsi:.1f}")
+
+            # --- EXPORT PROFESSIONALE (DATI VERI) ---
+            st.divider()
+            cw, ce = st.columns(2)
+            with cw:
+                if st.button("📝 Genera Report Word"):
+                    doc = Document()
+                    doc.add_heading(f"Analisi SFM Master: {info.get('longName')}", 0)
+                    doc.add_heading("Valutazione Intrinseca", level=1)
+                    doc.add_paragraph(f"Sulla base di una crescita del {g_rate*100}% e un WACC del {wacc*100}%, il valore stimato è ${fair_value:.2f}.")
+                    doc.add_heading("Analisi Business", level=1)
+                    doc.add_paragraph(info.get('longBusinessSummary', ''))
+                    buf = io.BytesIO()
+                    doc.save(buf)
+                    st.download_button("Scarica Word", buf.getvalue(), f"Report_{ticker}.docx")
+            
+            with ce:
+                output = io.BytesIO()
+                df_dcf = pd.DataFrame({'Anno': anni, 'FCF': fcf_list, 'PV': pv_list})
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df_dcf.to_excel(writer, sheet_name='DCF_Model_10Y')
+                    pd.DataFrame([info]).to_excel(writer, sheet_name='Info_Generali')
+                st.download_button("Scarica Excel", output.getvalue(), f"Modello_{ticker}.xlsx")
+
+            # --- GRAFICO A CANDELE (IN FONDO E FUNZIONANTE) ---
+            st.divider()
+            st.subheader("📈 Analisi Tecnica e Trend")
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
             fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'], name='Price'), row=1, col=1)
             
-            # RSI
-            delta = hist['Close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            hist['RSI'] = 100 - (100 / (1 + (gain/loss)))
+            # Calcolo RSI per tutto lo storico grafico
+            hist_delta = hist['Close'].diff()
+            h_gain = (hist_delta.where(hist_delta > 0, 0)).rolling(14).mean()
+            h_loss = (-hist_delta.where(hist_delta < 0, 0)).rolling(14).mean()
+            hist['RSI_Plot'] = 100 - (100 / (1 + (h_gain/h_loss)))
             
-            fig.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], name='RSI', line=dict(color='orange')), row=2, col=1)
-            fig.update_layout(template='plotly_dark', height=600, xaxis_rangeslider_visible=False, showlegend=False)
+            fig.add_trace(go.Scatter(x=hist.index, y=hist['RSI_Plot'], name='RSI', line=dict(color='orange')), row=2, col=1)
+            fig.update_layout(template='plotly_dark', height=700, xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True)
 
+        else:
+            st.warning("Dati di bilancio o storici insufficienti per l'analisi profonda.")
+
     except Exception as e:
-        st.error(f"Errore: {e}")
+        st.error(f"Errore tecnico: {e}")
