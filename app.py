@@ -4,80 +4,74 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import io
-import requests
 
-# SISTEMA DI SICUREZZA: Se la libreria manca, il sito NON si rompe
-try:
-    from docx import Document
-    DOCX_AVAILABLE = True
-except Exception:
-    DOCX_AVAILABLE = False
-
-st.set_page_config(page_title="SFM Terminal", layout="wide")
-
-def get_ticker_from_name(name):
-    try:
-        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={name}"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-        data = res.json()
-        return data['quotes'][0]['symbol']
-    except: return name
+st.set_page_config(page_title="SFM Slim Terminal", layout="wide")
 
 st.title("🏦 SFM Intelligence Terminal")
 
-# --- INPUT E DATI ---
-search_query = st.text_input("Cerca Azienda (es: Tenaris, Apple, Tesla)", "Tenaris")
-ticker = get_ticker_from_name(search_query)
+# --- RICERCA ---
+ticker = st.text_input("Inserisci Ticker (es: TS, AAPL, ENI.MI)", "TS").upper()
 
 if ticker:
-    stock = yf.Ticker(ticker)
-    info = stock.info
-    hist = stock.history(period="1y")
-    
-    if not hist.empty:
-        # --- VALUTAZIONE DCF ---
-        st.header(f"💎 Valutazione: {info.get('longName', ticker)}")
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        hist = stock.history(period="1y")
         
-        prezzo_att = info.get('currentPrice', 0)
-        div_yield = info.get('dividendYield', 0) * 100
-        st.write(f"**Prezzo Attuale:** ${prezzo_att} | **Rendimento Dividendi:** {div_yield:.2f}%")
+        if not hist.empty:
+            # --- DATI E DCF ---
+            st.header(f"Analisi: {info.get('longName', ticker)}")
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Prezzo Attuale", f"${info.get('currentPrice', 0)}")
+            col2.metric("Dividend Yield", f"{info.get('dividendYield', 0)*100:.2f}%")
+            col3.metric("Market Cap", f"${info.get('marketCap', 0)/1e9:.2f}B")
 
-        # --- SEZIONE DOWNLOAD ---
-        st.divider()
-        col_w, col_e = st.columns(2)
-        
-        with col_w:
-            if DOCX_AVAILABLE:
-                if st.button("Genera Report Word (ITA)"):
-                    doc = Document()
-                    doc.add_heading(f'Analisi SFM: {info.get("longName")}', 0)
-                    doc.add_paragraph(f"Prezzo di mercato: ${prezzo_att}")
-                    buffer = io.BytesIO()
-                    doc.save(buffer)
-                    st.download_button("Scarica Word", buffer.getvalue(), f"Report_{ticker}.docx")
+            st.divider()
+            st.subheader("💎 Valutazione Intrinseca (Modello SFM)")
+            
+            cf = stock.cashflow
+            if 'Free Cash Flow' in cf.index:
+                fcf = cf.loc['Free Cash Flow'].iloc[0]
+                pfn = info.get('totalCash', 0) - info.get('totalDebt', 0)
+                
+                c1, c2 = st.columns(2)
+                wacc = c1.slider("Tasso Sconto (WACC) %", 5.0, 15.0, 9.0) / 100
+                growth = c2.slider("Crescita Annuale %", 0.0, 20.0, 5.0) / 100
+                
+                # Calcolo DCF Semplificato
+                term_val = (fcf * (1 + 0.02)) / (wacc - 0.02)
+                fair_value = (((fcf * (1+growth)) + term_val) + pfn) / info.get('sharesOutstanding', 1)
+                margine = (1 - (info.get('currentPrice') / fair_value)) * 100
+                
+                st.metric("Fair Value Stimato", f"${fair_value:.2f}", f"Margine: {margine:.1f}%")
             else:
-                st.warning("⚠️ Funzione Word in attivazione. Il grafico sotto è comunque disponibile.")
+                st.warning("Dati Free Cash Flow non disponibili per il calcolo automatico.")
 
-        with col_e:
-            output_ex = io.BytesIO()
-            with pd.ExcelWriter(output_ex, engine='openpyxl') as writer:
-                hist.tail(60).to_excel(writer, sheet_name='Dati')
-            st.download_button("Scarica Excel", output_ex.getvalue(), f"Dati_{ticker}.xlsx")
+            # --- EXCEL ---
+            st.divider()
+            buf = io.BytesIO() # Se dà errore 'io', aggiungi 'import io' in alto
+            import io
+            with pd.ExcelWriter(buf, engine='xlsxwriter') as writer: # se non hai xlsxwriter usa openpyxl
+                hist.to_excel(writer, sheet_name='Dati')
+            st.download_button("📥 Scarica Dati Excel", buf.getvalue(), f"{ticker}_data.xlsx")
 
-        # --- GRAFICO A FINE PAGINA (SEMPRE VISIBILE) ---
-        st.divider()
-        st.subheader("📈 Analisi Tecnica e RSI")
-        
-        delta = hist['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        hist['RSI'] = 100 - (100 / (1 + (gain/loss)))
+            # --- GRAFICO IN FONDO ---
+            st.divider()
+            st.subheader("📈 Analisi Tecnica")
+            
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+            fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'], name='Price'), row=1, col=1)
+            
+            # RSI veloce
+            delta = hist['Close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            hist['RSI'] = 100 - (100 / (1 + (gain/loss)))
+            
+            fig.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], name='RSI', line=dict(color='orange')), row=2, col=1)
+            fig.update_layout(template='plotly_dark', height=600, xaxis_rangeslider_visible=False, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
 
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-        fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'], name='Prezzo'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], line=dict(color='orange')), row=2, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-        fig.update_layout(template='plotly_dark', height=600, xaxis_rangeslider_visible=False, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"Errore: Ticker non trovato o dati mancanti. ({e})")
