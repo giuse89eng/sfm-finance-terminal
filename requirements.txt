@@ -3,5 +3,6 @@ yfinance
 pandas
 numpy
 plotly
-matplotlib
 openpyxl
+python-docx
+requests
